@@ -50,16 +50,32 @@ export default function BalanceSummaryCard({ data, view = 'full' }: Props) {
               Closing Balance <span className="text-gray-400 font-normal">(After Reconciliation)</span>
             </h4>
             <div className="space-y-1.5 text-sm mb-3">
-              <Row label="Company A (Unmatched Net)" value={fmt(cb.company_a)} cls="font-bold text-navy-800" bold />
-              <Row label="Company B (Unmatched Net)" value={fmt(cb.company_b)} cls="font-bold text-navy-800" bold />
+              <Row label={`Company A — Unmatched`} value="" cls="font-semibold text-gray-700" bold />
+              <Row label="  Debit" value={fmt(cb.a_debit ?? 0)} cls="text-emerald-700" />
+              <Row label="  Credit" value={fmt(cb.a_credit ?? 0)} cls="text-red-600" />
+              <Row label="  Net" value={fmt(cb.company_a)} cls="font-bold text-navy-800" bold />
             </div>
-            <div className="border-t border-gray-200 pt-2">
+            <div className="space-y-1.5 text-sm mb-3">
+              <Row label={`Company B — Unmatched`} value="" cls="font-semibold text-gray-700" bold />
+              <Row label="  Debit" value={fmt(cb.b_debit ?? 0)} cls="text-emerald-700" />
+              <Row label="  Credit" value={fmt(cb.b_credit ?? 0)} cls="text-red-600" />
+              <Row label="  Net" value={fmt(cb.company_b)} cls="font-bold text-navy-800" bold />
+            </div>
+            <div className="border-t border-gray-200 pt-2 space-y-1">
               <div className="flex justify-between text-sm">
                 <span className="font-bold text-gray-700">Closing Balance Difference</span>
                 <span className={`font-mono font-bold ${diffCls(cb.difference)}`}>
                   {cb.difference === 0 ? 'Nil' : fmt(cb.difference)}
                 </span>
               </div>
+              {cb.verified !== undefined && (
+                <div className="flex justify-between text-xs">
+                  <span className="text-gray-500">Calculated vs Ledger Closing</span>
+                  <span className={cb.verified ? 'text-emerald-600 font-semibold' : 'text-red-600 font-semibold'}>
+                    {cb.verified ? '✓ Verified' : '✗ Mismatch'}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         </div>

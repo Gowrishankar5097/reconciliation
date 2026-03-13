@@ -7,3 +7,13 @@ rapidfuzz
 openpyxl
 xlsxwriter
 xlrd
+pdfplumber
+tabula-py
+PyPDF2
+requests
+gspread
+google-auth
+openai
+pdf2image
+Pillow
+PyMuPDF

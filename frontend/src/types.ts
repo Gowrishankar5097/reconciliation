@@ -1,3 +1,8 @@
+export interface FileInfo {
+  name: string;
+  rows: number;
+}
+
 export interface UploadResponse {
   file_a: string;
   file_b: string;
@@ -7,6 +12,28 @@ export interface UploadResponse {
   columns_b: string[];
   preview_a: Record<string, unknown>[];
   preview_b: Record<string, unknown>[];
+  files_a?: FileInfo[];
+  files_b?: FileInfo[];
+  company_name_a?: string;
+  company_name_b?: string;
+}
+
+export interface AddFileResponse {
+  company: string;
+  file_added: string;
+  rows_added: number;
+  total_rows: number;
+  files_a: FileInfo[];
+  files_b: FileInfo[];
+  total_a: number;
+  total_b: number;
+}
+
+export interface FilesResponse {
+  files_a: FileInfo[];
+  files_b: FileInfo[];
+  total_rows_a: number;
+  total_rows_b: number;
 }
 
 export interface ReconcileResponse {
@@ -67,6 +94,11 @@ export interface BalanceSummary {
   };
   closing_balance: {
     company_a: number; company_b: number; difference: number;
+    a_debit?: number; a_credit?: number;
+    b_debit?: number; b_credit?: number;
+    calculated_a?: number; calculated_b?: number;
+    calculated_difference?: number;
+    verified?: boolean;
   };
   balance_difference: number;
   matched_summary: {

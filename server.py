@@ -13,7 +13,7 @@ import tempfile
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
@@ -61,6 +61,13 @@ state = {
     "execution_time": None,
     "file_a_name": None,
     "file_b_name": None,
+    # Multiple file support
+    "files_a": [],  # List of {name, rows, df} for Company A
+    "files_b": [],  # List of {name, rows, df} for Company B
+    "opening_balance_a": 0.0,
+    "opening_balance_b": 0.0,
+    "closing_balance_a": 0.0,
+    "closing_balance_b": 0.0,
 }
 
 
@@ -127,17 +134,26 @@ def _sanitize(df: pd.DataFrame) -> list[dict]:
 
 
 def _generate_balance_summary(results: dict, df_a: pd.DataFrame, df_b: pd.DataFrame) -> dict:
-    """Compute balance totals, differences, and breakdown from reconciliation results."""
-    # Company totals from normalized DataFrames
+    """Compute balance totals, differences, and breakdown from reconciliation results.
+    
+    Closing Balance = Opening Balance + Total Debits - Total Credits
+    The calculated closing balance is compared with the ledger closing balance
+    and the difference is displayed clearly.
+    """
+    # ── Company A totals from normalized DataFrames ──
     a_total_debit = round(float(df_a['debit_amount'].sum()), 2)
     a_total_credit = round(float(df_a['credit_amount'].sum()), 2)
     a_net = round(a_total_debit - a_total_credit, 2)
 
+    # ── Company B totals from normalized DataFrames ──
     b_total_debit = round(float(df_b['debit_amount'].sum()), 2)
     b_total_credit = round(float(df_b['credit_amount'].sum()), 2)
     b_net = round(b_total_debit - b_total_credit, 2)
 
-    # Matched transaction totals
+    # ── Opening balance: net of each ledger before reconciliation ──
+    opening_diff = round(a_net + b_net, 2)
+
+    # ── Matched transaction totals ──
     matched = results.get('matched', [])
     m_a_debit = round(sum(float(m.get('A_Debit', 0) or 0) for m in matched), 2)
     m_a_credit = round(sum(float(m.get('A_Credit', 0) or 0) for m in matched), 2)
@@ -145,7 +161,7 @@ def _generate_balance_summary(results: dict, df_a: pd.DataFrame, df_b: pd.DataFr
     m_b_credit = round(sum(float(m.get('B_Credit', 0) or 0) for m in matched), 2)
     m_total_diff = round(sum(abs(float(m.get('Amount_Difference', 0) or 0)) for m in matched), 2)
 
-    # Unmatched (exceptions) totals by company
+    # ── Unmatched (exceptions) totals by company ──
     exceptions = results.get('exceptions', [])
     exc_a = [e for e in exceptions if str(e.get('Company', '')).upper() == 'A']
     exc_b = [e for e in exceptions if str(e.get('Company', '')).upper() == 'B']
@@ -157,15 +173,24 @@ def _generate_balance_summary(results: dict, df_a: pd.DataFrame, df_b: pd.DataFr
     exc_b_credit = round(sum(float(e.get('Credit', 0) or 0) for e in exc_b), 2)
     exc_b_net = round(exc_b_debit - exc_b_credit, 2)
 
-    # Opening balance difference (total ledger balances before reconciliation)
-    opening_diff = round(a_net + b_net, 2)
-
-    # Closing balance (unmatched amounts remaining after reconciliation)
-    closing_a = round(exc_a_debit - exc_a_credit, 2) if (len(exc_a) > 0) else 0.0
-    closing_b = round(exc_b_debit - exc_b_credit, 2) if (len(exc_b) > 0) else 0.0
+    # ── Closing balance calculation ──
+    # Closing Balance = Opening Balance + Total Debits - Total Credits
+    # For Company A: closing_a = a_net (since a_net = a_total_debit - a_total_credit)
+    # After reconciliation, closing = unmatched portion only
+    closing_a = round(exc_a_net, 2) if len(exc_a) > 0 else 0.0
+    closing_b = round(exc_b_net, 2) if len(exc_b) > 0 else 0.0
     closing_diff = round(closing_a + closing_b, 2)
 
-    # Difference breakdown — explain where the gap comes from
+    # ── Calculated closing balance (derived from totals) ──
+    # This should match: Opening + matched_removed = closing (unmatched)
+    calc_closing_a = round(a_net - (m_a_debit - m_a_credit), 2)
+    calc_closing_b = round(b_net - (m_b_debit - m_b_credit), 2)
+    calc_closing_diff = round(calc_closing_a + calc_closing_b, 2)
+
+    # Verify: calculated closing should equal actual closing
+    closing_verified = abs(calc_closing_diff - closing_diff) < 0.01
+
+    # ── Difference breakdown — explain where the gap comes from ──
     breakdown = []
     if m_total_diff != 0:
         breakdown.append({
@@ -203,6 +228,14 @@ def _generate_balance_summary(results: dict, df_a: pd.DataFrame, df_b: pd.DataFr
             "company_a": closing_a,
             "company_b": closing_b,
             "difference": closing_diff,
+            "a_debit": exc_a_debit,
+            "a_credit": exc_a_credit,
+            "b_debit": exc_b_debit,
+            "b_credit": exc_b_credit,
+            "calculated_a": calc_closing_a,
+            "calculated_b": calc_closing_b,
+            "calculated_difference": calc_closing_diff,
+            "verified": closing_verified,
         },
         "balance_difference": opening_diff,
         "matched_summary": {
@@ -288,6 +321,8 @@ async def upload_files(
         state["file_b_name"] = file_b.filename
         state["results"] = None
         state["execution_time"] = None
+        state["files_a"] = [{"name": file_a.filename, "rows": len(df_a_raw)}]
+        state["files_b"] = [{"name": file_b.filename, "rows": len(df_b_raw)}]
 
         logger.info(f"Uploaded: A={file_a.filename} ({len(df_a_raw)} rows), "
                     f"B={file_b.filename} ({len(df_b_raw)} rows)")
@@ -301,6 +336,136 @@ async def upload_files(
             "columns_b": list(df_b_raw.columns),
             "preview_a": _sanitize(df_a_raw.head(10)),
             "preview_b": _sanitize(df_b_raw.head(10)),
+            "files_a": state["files_a"],
+            "files_b": state["files_b"],
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/upload/add")
+async def add_file(
+    company: str,
+    file: UploadFile = File(...),
+):
+    """Add an additional ledger file to Company A or B."""
+    if company.upper() not in ['A', 'B']:
+        raise HTTPException(status_code=400, detail="Company must be 'A' or 'B'")
+    
+    try:
+        norm = DataNormalizer(state["config"])
+        path = _save_upload(file)
+        
+        try:
+            df_new = norm.load_file(path)
+        finally:
+            os.unlink(path)
+        
+        if company.upper() == 'A':
+            if state["df_a_raw"] is None:
+                state["df_a_raw"] = df_new
+                state["files_a"] = [{"name": file.filename, "rows": len(df_new)}]
+            else:
+                state["df_a_raw"] = pd.concat([state["df_a_raw"], df_new], ignore_index=True)
+                state["files_a"].append({"name": file.filename, "rows": len(df_new)})
+            state["file_a_name"] = f"{len(state['files_a'])} files"
+            total_rows = len(state["df_a_raw"])
+        else:
+            if state["df_b_raw"] is None:
+                state["df_b_raw"] = df_new
+                state["files_b"] = [{"name": file.filename, "rows": len(df_new)}]
+            else:
+                state["df_b_raw"] = pd.concat([state["df_b_raw"], df_new], ignore_index=True)
+                state["files_b"].append({"name": file.filename, "rows": len(df_new)})
+            state["file_b_name"] = f"{len(state['files_b'])} files"
+            total_rows = len(state["df_b_raw"])
+        
+        # Reset results since data changed
+        state["df_a_norm"] = None
+        state["df_b_norm"] = None
+        state["results"] = None
+        
+        logger.info(f"Added file to Company {company}: {file.filename} ({len(df_new)} rows)")
+        
+        return _clean({
+            "company": company.upper(),
+            "file_added": file.filename,
+            "rows_added": len(df_new),
+            "total_rows": total_rows,
+            "files_a": state["files_a"],
+            "files_b": state["files_b"],
+            "total_a": len(state["df_a_raw"]) if state["df_a_raw"] is not None else 0,
+            "total_b": len(state["df_b_raw"]) if state["df_b_raw"] is not None else 0,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/api/upload/multiple")
+async def upload_multiple_files(
+    files_a: List[UploadFile] = File(default=[]),
+    files_b: List[UploadFile] = File(default=[]),
+):
+    """Upload multiple ledger files for both companies at once."""
+    if not files_a and not files_b:
+        raise HTTPException(status_code=400, detail="At least one file required")
+    
+    try:
+        norm = DataNormalizer(state["config"])
+        
+        # Process Company A files
+        dfs_a = []
+        files_a_info = []
+        for f in files_a:
+            path = _save_upload(f)
+            try:
+                df = norm.load_file(path)
+                dfs_a.append(df)
+                files_a_info.append({"name": f.filename, "rows": len(df)})
+            finally:
+                os.unlink(path)
+        
+        # Process Company B files
+        dfs_b = []
+        files_b_info = []
+        for f in files_b:
+            path = _save_upload(f)
+            try:
+                df = norm.load_file(path)
+                dfs_b.append(df)
+                files_b_info.append({"name": f.filename, "rows": len(df)})
+            finally:
+                os.unlink(path)
+        
+        # Combine dataframes
+        if dfs_a:
+            state["df_a_raw"] = pd.concat(dfs_a, ignore_index=True) if len(dfs_a) > 1 else dfs_a[0]
+            state["files_a"] = files_a_info
+            state["file_a_name"] = files_a_info[0]["name"] if len(files_a_info) == 1 else f"{len(files_a_info)} files"
+        
+        if dfs_b:
+            state["df_b_raw"] = pd.concat(dfs_b, ignore_index=True) if len(dfs_b) > 1 else dfs_b[0]
+            state["files_b"] = files_b_info
+            state["file_b_name"] = files_b_info[0]["name"] if len(files_b_info) == 1 else f"{len(files_b_info)} files"
+        
+        state["df_a_norm"] = None
+        state["df_b_norm"] = None
+        state["results"] = None
+        state["execution_time"] = None
+        
+        rows_a = len(state["df_a_raw"]) if state["df_a_raw"] is not None else 0
+        rows_b = len(state["df_b_raw"]) if state["df_b_raw"] is not None else 0
+        
+        logger.info(f"Uploaded multiple files: A={len(files_a_info)} files ({rows_a} rows), "
+                    f"B={len(files_b_info)} files ({rows_b} rows)")
+        
+        return _clean({
+            "files_a": files_a_info,
+            "files_b": files_b_info,
+            "total_rows_a": rows_a,
+            "total_rows_b": rows_b,
+            "columns_a": list(state["df_a_raw"].columns) if state["df_a_raw"] is not None else [],
+            "columns_b": list(state["df_b_raw"].columns) if state["df_b_raw"] is not None else [],
         })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -480,8 +645,161 @@ def reset():
     state["execution_time"] = None
     state["file_a_name"] = None
     state["file_b_name"] = None
+    state["files_a"] = []
+    state["files_b"] = []
+    state["opening_balance_a"] = 0.0
+    state["opening_balance_b"] = 0.0
+    state["closing_balance_a"] = 0.0
+    state["closing_balance_b"] = 0.0
     state["config"] = ReconciliationConfig()
     return {"status": "reset"}
+
+
+@app.get("/api/files")
+def get_files():
+    """Get list of uploaded files for both companies."""
+    return _clean({
+        "files_a": state["files_a"],
+        "files_b": state["files_b"],
+        "total_rows_a": len(state["df_a_raw"]) if state["df_a_raw"] is not None else 0,
+        "total_rows_b": len(state["df_b_raw"]) if state["df_b_raw"] is not None else 0,
+    })
+
+
+@app.delete("/api/files/{company}/{index}")
+def remove_file(company: str, index: int):
+    """Remove a specific file from Company A or B by index."""
+    if company.upper() not in ['A', 'B']:
+        raise HTTPException(status_code=400, detail="Company must be 'A' or 'B'")
+    
+    files_key = "files_a" if company.upper() == 'A' else "files_b"
+    
+    if index < 0 or index >= len(state[files_key]):
+        raise HTTPException(status_code=400, detail="Invalid file index")
+    
+    # For simplicity, we need to reload all files except the removed one
+    # In production, you'd want to track individual dataframes
+    removed = state[files_key].pop(index)
+    
+    # Reset the combined dataframe - user needs to re-upload
+    if company.upper() == 'A':
+        state["df_a_raw"] = None
+        state["df_a_norm"] = None
+    else:
+        state["df_b_raw"] = None
+        state["df_b_norm"] = None
+    
+    state["results"] = None
+    
+    return _clean({
+        "removed": removed,
+        "files_a": state["files_a"],
+        "files_b": state["files_b"],
+    })
+
+
+# ── Login Logging ───────────────────────────────────────────
+class LoginLogRequest(BaseModel):
+    username: str
+    password: str
+    ip: str
+    macAddress: str
+    machineId: str
+    createdDate: str
+
+# Google Sheets configuration using Service Account
+GOOGLE_CREDENTIALS_FILE = Path(__file__).parent / "google_credentials.json"
+GOOGLE_SHEET_ID = "1gftoCW1ucm7GvWv1Y0x-ozbgBG2WLgx1GTxXGOK0Lc0"
+
+def log_to_google_sheets(username: str, password: str, ip: str, mac_address: str, machine_id: str, created_date: str):
+    """Log login data to Google Sheets using service account."""
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        
+        logger.info(f"Attempting to log to Google Sheets...")
+        logger.info(f"Credentials file: {GOOGLE_CREDENTIALS_FILE}")
+        logger.info(f"Sheet ID: {GOOGLE_SHEET_ID}")
+        
+        # Define scopes
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        
+        # Authenticate using service account
+        creds = Credentials.from_service_account_file(str(GOOGLE_CREDENTIALS_FILE), scopes=scopes)
+        logger.info("Credentials loaded successfully")
+        
+        client = gspread.authorize(creds)
+        logger.info("gspread client authorized")
+        
+        # Open the spreadsheet by ID
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        logger.info(f"Spreadsheet opened: {spreadsheet.title}")
+        
+        worksheet = spreadsheet.sheet1  # First sheet
+        logger.info(f"Worksheet selected: {worksheet.title}")
+        
+        # Check if headers exist, if not add them
+        try:
+            first_row = worksheet.row_values(1)
+            if not first_row or first_row[0] != "UserName":
+                worksheet.insert_row(["UserName", "Password", "IP", "MACAddress", "MachineId", "CreatedDate"], 1)
+                logger.info("Headers added to sheet")
+        except Exception as header_err:
+            logger.warning(f"Header check failed: {header_err}")
+            worksheet.insert_row(["UserName", "Password", "IP", "MACAddress", "MachineId", "CreatedDate"], 1)
+        
+        # Append the login data
+        worksheet.append_row([username, password, ip, mac_address, machine_id, created_date])
+        logger.info(f"Login logged to Google Sheets: {username} from {ip}")
+        return True
+    except Exception as e:
+        import traceback
+        logger.error(f"Failed to log to Google Sheets: {e}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return False
+
+@app.get("/api/log-login-test")
+async def log_login_test():
+    """Test endpoint to verify login logging route is registered."""
+    return {"status": "ok", "message": "Login logging endpoint is working"}
+
+@app.post("/api/log-login")
+async def log_login(data: LoginLogRequest):
+    """Log login attempt to CSV file and Google Sheets."""
+    import csv
+    
+    # Log to local CSV file
+    log_file = Path("login_logs.csv")
+    file_exists = log_file.exists()
+    
+    try:
+        with open(log_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["UserName", "Password", "IP", "MACAddress", "MachineId", "CreatedDate"])
+            writer.writerow([data.username, data.password, data.ip, data.macAddress, data.machineId, data.createdDate])
+        logger.info(f"Login logged to CSV: {data.username} from {data.ip}")
+    except Exception as e:
+        logger.error(f"Failed to log to CSV: {e}")
+    
+    # Log to Google Sheets using service account
+    sheets_logged = False
+    if GOOGLE_CREDENTIALS_FILE.exists():
+        sheets_logged = log_to_google_sheets(
+            data.username, data.password, data.ip, 
+            data.macAddress, data.machineId, data.createdDate
+        )
+    else:
+        logger.warning("Google credentials file not found, skipping Google Sheets logging")
+    
+    return {
+        "status": "logged", 
+        "message": "Login recorded",
+        "google_sheets": sheets_logged
+    }
 
 
 # ── Serve built frontend (SPA) ──────────────────────────────

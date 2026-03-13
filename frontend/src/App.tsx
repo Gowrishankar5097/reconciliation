@@ -1,13 +1,14 @@
 import { useState, useCallback, useEffect } from 'react';
-import { RotateCcw, Loader2, X, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { RotateCcw, Loader2, X, AlertCircle, CheckCircle2, LogOut } from 'lucide-react';
 import Stepper from './components/Stepper';
 import UploadScreen from './components/UploadScreen';
 import DataPreview from './components/DataPreview';
 import ResultsDashboard from './components/ResultsDashboard';
 import MatchDetails from './components/MatchDetails';
 import Exceptions from './components/Exceptions';
+import LoginPage from './components/LoginPage';
 import { reconcile, resetAll } from './api';
-import type { UploadResponse } from './types';
+import type { UploadResponse, FileInfo as FileInfoType } from './types';
 
 // ── Toast notification ───────────────────────────────────────
 interface Toast { id: number; type: 'error' | 'success'; message: string }
@@ -30,18 +31,20 @@ function ToastContainer({ toasts, onDismiss }: { toasts: Toast[]; onDismiss: (id
 }
 
 // ── Allowed file extensions ──────────────────────────────────
-const VALID_EXT = ['.xls', '.xlsx', '.csv'];
+const VALID_EXT = ['.xls', '.xlsx', '.csv', '.pdf', '.txt'];
 const MIN_FILE_SIZE = 50; // bytes — empty file threshold
 
 function validateFile(file: File): string | null {
   const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-  if (!VALID_EXT.includes(ext)) return `"${file.name}" is not a valid format. Use .xls, .xlsx, or .csv`;
+  if (!VALID_EXT.includes(ext)) return `"${file.name}" is not a valid format. Use .xls, .xlsx, .csv, .pdf, or .txt`;
   if (file.size < MIN_FILE_SIZE) return `"${file.name}" appears to be empty (${file.size} bytes)`;
   if (file.size > 50 * 1024 * 1024) return `"${file.name}" is too large (max 50 MB)`;
   return null;
 }
 
 export default function App() {
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [loggedInUser, setLoggedInUser] = useState('');
   const [step, setStep] = useState(0);
   const [hasData, setHasData] = useState(false);
   const [hasResults, setHasResults] = useState(false);
@@ -53,6 +56,33 @@ export default function App() {
   const [uploadValid, setUploadValid] = useState(true);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [toastId, setToastId] = useState(0);
+  const [companyNameA, setCompanyNameA] = useState('');
+  const [companyNameB, setCompanyNameB] = useState('');
+
+  const handleLogin = useCallback((username: string) => {
+    setIsLoggedIn(true);
+    setLoggedInUser(username);
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    setIsLoggedIn(false);
+    setLoggedInUser('');
+    // Reset all state
+    setStep(0);
+    setHasData(false);
+    setHasResults(false);
+    setUploadInfo(null);
+    setUploadValid(true);
+    setDataKey(0);
+    setResultKey(0);
+    setUploadKey((k) => k + 1);
+    setToasts([]);
+  }, []);
+
+  const handleCompanyNameChange = useCallback((company: 'A' | 'B', name: string) => {
+    if (company === 'A') setCompanyNameA(name);
+    else setCompanyNameB(name);
+  }, []);
 
   const addToast = useCallback((type: 'error' | 'success', message: string) => {
     const id = Date.now();
@@ -83,6 +113,9 @@ export default function App() {
       addToast('error', `Ledger file has no data rows (A: ${data.rows_a}, B: ${data.rows_b}). Please upload valid ledger files.`);
       return;
     }
+    // Store company names from upload
+    if (data.company_name_a) setCompanyNameA(data.company_name_a);
+    if (data.company_name_b) setCompanyNameB(data.company_name_b);
     setUploadInfo(data);
     setHasData(true);
     setHasResults(false);
@@ -124,6 +157,11 @@ export default function App() {
     addToast('success', 'All data cleared');
   }, [addToast]);
 
+  // Show login page if not logged in
+  if (!isLoggedIn) {
+    return <LoginPage onLogin={handleLogin} />;
+  }
+
   return (
     <div className="h-screen w-screen bg-gradient-to-br from-gray-50 to-gray-100 flex flex-col overflow-hidden">
       {/* Toast notifications */}
@@ -147,13 +185,22 @@ export default function App() {
           <Stepper active={step} onStep={setStep} hasData={hasData} hasResults={hasResults} />
         </div>
 
-        {/* Right — Reset */}
-        <button
-          onClick={handleReset}
-          className="flex items-center gap-2 px-4 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium transition-all duration-200 shrink-0 hover:scale-105 active:scale-95"
-        >
-          <RotateCcw size={13} /> Reset
-        </button>
+        {/* Right — User info & Actions */}
+        <div className="flex items-center gap-3 shrink-0">
+          <span className="text-xs text-navy-300">{loggedInUser}</span>
+          <button
+            onClick={handleReset}
+            className="flex items-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/20 rounded-lg text-xs font-medium transition-all duration-200 hover:scale-105 active:scale-95"
+          >
+            <RotateCcw size={13} /> Reset
+          </button>
+          <button
+            onClick={handleLogout}
+            className="flex items-center gap-2 px-3 py-2 bg-red-500/20 hover:bg-red-500/30 rounded-lg text-xs font-medium transition-all duration-200 hover:scale-105 active:scale-95 text-red-200"
+          >
+            <LogOut size={13} /> Logout
+          </button>
+        </div>
       </header>
 
       {/* Content — fills remaining viewport */}
@@ -165,15 +212,30 @@ export default function App() {
               onUploaded={handleUploaded}
               onValidationError={handleUploadError}
               validateFile={validateFile}
+              companyNameA={companyNameA}
+              companyNameB={companyNameB}
+              onCompanyNameChange={handleCompanyNameChange}
             />
 
             {/* Post-upload: show file info + reconcile button */}
             {hasData && uploadInfo && (
-              <div className="max-w-3xl mx-auto px-6 pb-8 animate-fadeIn">
+              <div className="max-w-4xl mx-auto px-6 pb-8 animate-fadeIn">
                 <div className="bg-white rounded-xl border border-gray-200 shadow-sm p-6">
                   <div className="grid grid-cols-2 gap-6 mb-6">
-                    <FileInfo label="Company A" name={uploadInfo.file_a} rows={uploadInfo.rows_a} cols={uploadInfo.columns_a.length} />
-                    <FileInfo label="Company B" name={uploadInfo.file_b} rows={uploadInfo.rows_b} cols={uploadInfo.columns_b.length} />
+                    <FileInfo
+                      label={companyNameA || 'Ledger 1'}
+                      name={uploadInfo.file_a}
+                      rows={uploadInfo.rows_a}
+                      cols={uploadInfo.columns_a.length}
+                      files={uploadInfo.files_a}
+                    />
+                    <FileInfo
+                      label={companyNameB || 'Ledger 2'}
+                      name={uploadInfo.file_b}
+                      rows={uploadInfo.rows_b}
+                      cols={uploadInfo.columns_b.length}
+                      files={uploadInfo.files_b}
+                    />
                   </div>
 
                   <div className="flex items-center justify-center">
@@ -198,21 +260,35 @@ export default function App() {
           </div>
         )}
 
-        {step === 1 && <ResultsDashboard key={`dash-${resultKey}`} />}
-        {step === 2 && <MatchDetails key={`match-${resultKey}`} />}
-        {step === 3 && <Exceptions key={`exc-${resultKey}`} />}
-        {step === 4 && <DataPreview key={`preview-${dataKey}`} />}
+        {step === 1 && <ResultsDashboard key={`dash-${resultKey}`} companyNameA={companyNameA || 'Ledger 1'} companyNameB={companyNameB || 'Ledger 2'} />}
+        {step === 2 && <MatchDetails key={`match-${resultKey}`} companyNameA={companyNameA || 'Ledger 1'} companyNameB={companyNameB || 'Ledger 2'} />}
+        {step === 3 && <Exceptions key={`exc-${resultKey}`} companyNameA={companyNameA || 'Ledger 1'} companyNameB={companyNameB || 'Ledger 2'} />}
+        {step === 4 && <DataPreview key={`preview-${dataKey}`} companyNameA={companyNameA || 'Ledger 1'} companyNameB={companyNameB || 'Ledger 2'} />}
       </main>
     </div>
   );
 }
 
-function FileInfo({ label, name, rows, cols }: { label: string; name: string; rows: number; cols: number }) {
+function FileInfo({ label, name, rows, cols, files }: { label: string; name: string; rows: number; cols: number; files?: FileInfoType[] }) {
   return (
     <div className="bg-gradient-to-br from-gray-50 to-gray-100/50 rounded-lg p-4 border border-gray-200 transition-all duration-200 hover:shadow-sm">
       <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-1">{label}</p>
-      <p className="font-semibold text-gray-800 text-sm truncate">{name}</p>
-      <p className="text-xs text-gray-500 mt-1">{rows} rows &middot; {cols} columns</p>
+      {files && files.length > 1 ? (
+        <>
+          <p className="font-semibold text-gray-800 text-sm">{files.length} files uploaded</p>
+          <div className="mt-2 space-y-1">
+            {files.map((f, i) => (
+              <p key={i} className="text-xs text-gray-500 truncate">• {f.name} ({f.rows} rows)</p>
+            ))}
+          </div>
+          <p className="text-xs text-gray-500 mt-1">{rows} total rows &middot; {cols} columns</p>
+        </>
+      ) : (
+        <>
+          <p className="font-semibold text-gray-800 text-sm truncate">{name}</p>
+          <p className="text-xs text-gray-500 mt-1">{rows} rows &middot; {cols} columns</p>
+        </>
+      )}
     </div>
   );
 }

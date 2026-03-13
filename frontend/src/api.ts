@@ -5,6 +5,9 @@ import type {
   FullResults,
   PreviewData,
   EngineConfig,
+  FileInfo,
+  AddFileResponse,
+  FilesResponse,
 } from './types';
 
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
@@ -15,6 +18,23 @@ export async function uploadFiles(fileA: File, fileB: File): Promise<UploadRespo
   form.append('file_a', fileA);
   form.append('file_b', fileB);
   const { data } = await api.post<UploadResponse>('/upload', form);
+  return data;
+}
+
+export async function addFile(company: 'A' | 'B', file: File): Promise<AddFileResponse> {
+  const form = new FormData();
+  form.append('file', file);
+  const { data } = await api.post<AddFileResponse>(`/upload/add?company=${company}`, form);
+  return data;
+}
+
+export async function getFiles(): Promise<FilesResponse> {
+  const { data } = await api.get<FilesResponse>('/files');
+  return data;
+}
+
+export async function removeFile(company: 'A' | 'B', index: number): Promise<FilesResponse> {
+  const { data } = await api.delete<FilesResponse>(`/files/${company}/${index}`);
   return data;
 }
 

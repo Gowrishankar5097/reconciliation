@@ -4,7 +4,12 @@ import DataTable from './DataTable';
 import { getPreview } from '../api';
 import type { PreviewData } from '../types';
 
-export default function DataPreview() {
+interface Props {
+  companyNameA: string;
+  companyNameB: string;
+}
+
+export default function DataPreview({ companyNameA, companyNameB }: Props) {
   const [data, setData] = useState<PreviewData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -40,10 +45,10 @@ export default function DataPreview() {
       {/* Tab buttons */}
       <div className="flex gap-2 mb-3 shrink-0">
         <TabBtn active={tab === 'a'} onClick={() => setTab('a')}>
-          {data.company_a.name} ({data.company_a.rows} rows)
+          {companyNameA} ({data.company_a.rows} rows)
         </TabBtn>
         <TabBtn active={tab === 'b'} onClick={() => setTab('b')}>
-          {data.company_b.name} ({data.company_b.rows} rows)
+          {companyNameB} ({data.company_b.rows} rows)
         </TabBtn>
       </div>
 
