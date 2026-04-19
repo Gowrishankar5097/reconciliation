@@ -396,36 +396,86 @@ Return ONLY the JSON object, no other text or explanation."""
 
         is_excel = detected_type == 'excel'
 
-        # --- First pass: read WITHOUT headers to find the real header row ---
-        if hasattr(file_path_or_buffer, 'seek'):
-            file_path_or_buffer.seek(0)
-
         if is_excel:
-            raw = self._read_excel_any(file_path_or_buffer, header=None)
-        else:
-            raw = pd.read_csv(file_path_or_buffer, header=None)
+            return self._load_best_excel_sheet(file_path_or_buffer)
 
+        # --- CSV: First pass WITHOUT headers to find the real header row ---
+        raw = pd.read_csv(file_path_or_buffer, header=None)
         header_row = self._find_header_row(raw)
 
-        # --- Second pass: read with the detected header row ---
+        if hasattr(file_path_or_buffer, 'seek'):
+            file_path_or_buffer.seek(0)
+        df = pd.read_csv(file_path_or_buffer, header=header_row)
+
+        df = self._merge_tally_particulars(df)
+        df = df.dropna(how='all').dropna(axis=1, how='all')
+        df = df.reset_index(drop=True)
+        return df
+
+    def _load_best_excel_sheet(self, file_path_or_buffer) -> pd.DataFrame:
+        """Read all sheets from an Excel file and return the one with the best
+        financial transaction data (date + debit/credit columns, most rows).
+        Uses a single pd.ExcelFile handle to avoid WinError 32 file-lock conflicts."""
+        _FINANCIAL_KEYWORDS = ['date', 'debit', 'credit', 'amount', 'balance',
+                               'withdrawal', 'deposit', 'transaction', 'voucher']
+
         if hasattr(file_path_or_buffer, 'seek'):
             file_path_or_buffer.seek(0)
 
-        if is_excel:
-            df = self._read_excel_any(file_path_or_buffer, header=header_row)
-        else:
-            df = pd.read_csv(file_path_or_buffer, header=header_row)
+        try:
+            xl = pd.ExcelFile(file_path_or_buffer)
+        except Exception:
+            if hasattr(file_path_or_buffer, 'seek'):
+                file_path_or_buffer.seek(0)
+            df = self._read_excel_any(file_path_or_buffer)
+            df = self._merge_tally_particulars(df)
+            df = df.dropna(how='all').dropna(axis=1, how='all')
+            return df.reset_index(drop=True)
 
-        # Handle Tally's split "Particulars" column:
-        # Tally exports have [Date, "Particulars"(To/By), <unnamed>(actual desc), Vch Type, ...]
-        # Merge the To/By prefix column with the unnamed description column
-        df = self._merge_tally_particulars(df)
+        best_df = None
+        best_score = -1
 
-        # Drop completely empty rows and columns
-        df = df.dropna(how='all').dropna(axis=1, how='all')
-        df = df.reset_index(drop=True)
+        try:
+            for sheet in xl.sheet_names:
+                try:
+                    raw = xl.parse(sheet_name=sheet, header=None)
+                    if raw.empty:
+                        continue
+                    header_row = self._find_header_row(raw)
+                    df = xl.parse(sheet_name=sheet, header=header_row)
+                    df = self._merge_tally_particulars(df)
+                    df = df.dropna(how='all').dropna(axis=1, how='all')
+                    df = df.reset_index(drop=True)
 
-        return df
+                    col_names = [str(c).lower() for c in df.columns]
+                    kw_hits = sum(
+                        1 for col in col_names
+                        if any(kw in col for kw in _FINANCIAL_KEYWORDS)
+                    )
+                    has_date = any('date' in c for c in col_names)
+                    score = kw_hits * len(df) * (2 if has_date else 1)
+
+                    logger.info(f"Sheet '{sheet}': header_row={header_row}, "
+                                f"rows={len(df)}, kw_hits={kw_hits}, score={score}")
+
+                    if score > best_score:
+                        best_score = score
+                        best_df = df
+                except Exception as exc:
+                    logger.warning(f"Sheet '{sheet}' skipped: {exc}")
+                    continue
+        finally:
+            xl.close()
+
+        if best_df is None or best_df.empty:
+            if hasattr(file_path_or_buffer, 'seek'):
+                file_path_or_buffer.seek(0)
+            df = self._read_excel_any(file_path_or_buffer)
+            df = self._merge_tally_particulars(df)
+            df = df.dropna(how='all').dropna(axis=1, how='all')
+            return df.reset_index(drop=True)
+
+        return best_df
 
     def _post_process_extracted(self, df: pd.DataFrame) -> pd.DataFrame:
         """Post-process extracted data (from PDF/SAP) to find headers and clean up."""
@@ -493,10 +543,12 @@ Return ONLY the JSON object, no other text or explanation."""
         best_score = 0
 
         for i in range(max_scan):
-            row_values = raw_df.iloc[i].astype(str).str.strip().str.lower().tolist()
+            row_values = raw_df.iloc[i].fillna('').astype(str).str.strip().str.lower().tolist()
             score = 0
             non_empty = 0
             for val in row_values:
+                if not isinstance(val, str):
+                    continue
                 if val and val != 'nan' and val != 'none':
                     non_empty += 1
                     for kw in self._HEADER_KEYWORDS:
@@ -695,9 +747,9 @@ Return ONLY the JSON object, no other text or explanation."""
             return df.reset_index(drop=True)
 
         # 3. Drop Opening Balance / Closing Balance rows
-        desc_lower = df['description'].astype(str).str.lower().str.strip()
+        desc_lower = df['description'].fillna('').astype(str).str.lower().str.strip()
         skip_mask = desc_lower.apply(
-            lambda x: any(s in x for s in self._SKIP_DESCRIPTIONS))
+            lambda x: any(s in str(x) for s in self._SKIP_DESCRIPTIONS) if pd.notna(x) else False)
         df = df[~skip_mask]
 
         # 4. Drop rows with zero amounts AND empty description

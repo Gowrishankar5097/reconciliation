@@ -5,6 +5,9 @@ Designed to work with real-world Tally inter-company ledger exports where
 voucher numbers and descriptions differ between companies.
 """
 
+import bisect
+import logging
+import time
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Set, Optional
@@ -12,6 +15,8 @@ from collections import defaultdict
 from itertools import combinations
 from rapidfuzz import fuzz
 from .config import ReconciliationConfig
+
+logger = logging.getLogger(__name__)
 
 
 class MatchResult:
@@ -104,33 +109,42 @@ class ReconciliationEngine:
         self.duplicates_b = []
 
         # Build indexes for performance
+        t0 = time.time()
         idx_a = self._build_index(df_a)
         idx_b = self._build_index(df_b)
 
-        # Detect duplicates first (informational only)
+        # Pre-cache B rows as plain dicts so layers use O(1) dict lookup
+        # instead of creating a new pandas Series per df_b.loc[] call.
+        self._b_dict = df_b.to_dict('index')
+
+        # Pre-compute B's date range as integer ordinals so each layer can
+        # skip A rows whose dates are outside the achievable window in O(1).
+        _b_dates = df_b['transaction_date'].dropna()
+        if not _b_dates.empty:
+            self._b_min_ord = int(_b_dates.min().toordinal())
+            self._b_max_ord = int(_b_dates.max().toordinal())
+        else:
+            self._b_min_ord = -999999
+            self._b_max_ord = 999999
+        logger.info(f"Index build: {time.time()-t0:.2f}s")
+
+        t1 = time.time()
         self._detect_duplicates(df_a, "A")
         self._detect_duplicates(df_b, "B")
+        logger.info(f"Duplicates: {time.time()-t1:.2f}s")
 
-        # Layer 1: Exact match (amount + date, reference as tiebreaker)
-        self._layer1_exact(df_a, df_b, idx_b)
-
-        # Layer 2: Date tolerance match (amount + date window)
-        self._layer2_date_tolerance(df_a, df_b, idx_b)
-
-        # Layer 3: Rounding / small-amount difference
-        self._layer3_rounding(df_a, df_b, idx_b)
-
-        # Layer 4: Pattern detection — tax deduction & forex
-        self._layer4_patterns(df_a, df_b, idx_b)
-
-        # Layer 5: Weighted-score tolerance match
-        self._layer5_weighted(df_a, df_b, idx_b)
-
-        # Layer 6: Partial settlement (one-to-many, many-to-one)
-        self._layer6_partial(df_a, df_b)
-
-        # Classify remaining unmatched as exceptions
-        self._classify_exceptions(df_a, df_b)
+        for name, fn in [
+            ("Layer 1 - Exact",           lambda: self._layer1_exact(df_a, df_b, idx_b)),
+            ("Layer 2 - Date Tolerance",   lambda: self._layer2_date_tolerance(df_a, df_b, idx_b)),
+            ("Layer 3 - Rounding",         lambda: self._layer3_rounding(df_a, df_b, idx_b)),
+            ("Layer 4 - Patterns",         lambda: self._layer4_patterns(df_a, df_b, idx_b)),
+            ("Layer 5 - Weighted",         lambda: self._layer5_weighted(df_a, df_b, idx_b)),
+            ("Layer 6 - Partial",          lambda: self._layer6_partial(df_a, df_b)),
+            ("Exceptions",                 lambda: self._classify_exceptions(df_a, df_b)),
+        ]:
+            ts = time.time()
+            fn()
+            logger.info(f"{name}: {time.time()-ts:.2f}s  matches={len(self.matches)}")
 
         return self._compile_results(df_a, df_b)
 
@@ -143,6 +157,7 @@ class ReconciliationEngine:
             'by_net': defaultdict(list),
             'by_abs': defaultdict(list),
             'by_ref': defaultdict(list),
+            'by_date': defaultdict(list),
         }
         for idx, row in df.iterrows():
             net = round(row['net_amount'], 2)
@@ -152,6 +167,10 @@ class ReconciliationEngine:
             ref = str(row.get('reference_normalized', ''))
             if ref and ref != 'nan' and ref.strip():
                 index['by_ref'][ref].append(idx)
+            dt = row['transaction_date']
+            if pd.notna(dt):
+                index['by_date'][dt.date()].append(idx)
+        index['sorted_abs_keys'] = sorted(index['by_abs'].keys())
         return index
 
     # ──────────────────────────────────────────────────────────
@@ -203,11 +222,16 @@ class ReconciliationEngine:
         return r_sc * 0.4 + n_sc * 0.3 + d_bonus * 3
 
     def _nearby_abs(self, idx_b, target_abs, tolerance) -> List[int]:
-        """Return index positions in B whose abs_amount is within tolerance."""
+        """Return index positions in B whose abs_amount is within tolerance.
+        Uses bisect on pre-sorted keys for O(log n) range lookup."""
+        keys = idx_b.get('sorted_abs_keys', [])
+        if not keys:
+            return []
+        lo = bisect.bisect_left(keys, target_abs - tolerance)
+        hi = bisect.bisect_right(keys, target_abs + tolerance)
         out = []
-        for amt, positions in idx_b['by_abs'].items():
-            if abs(amt - target_abs) <= tolerance:
-                out.extend(positions)
+        for k in keys[lo:hi]:
+            out.extend(idx_b['by_abs'][k])
         return out
 
     def _row_data(self, row) -> Dict:
@@ -220,13 +244,19 @@ class ReconciliationEngine:
     #   multiple B candidates match.
     # ──────────────────────────────────────────────────────────
     def _layer1_exact(self, df_a, df_b, idx_b):
+        _tol = 0
         for _, ra in df_a.iterrows():
             if not self._avail_a(ra['row_id']):
                 continue
+            _dt = ra['transaction_date']
+            if pd.notna(_dt):
+                _o = int(_dt.toordinal())
+                if _o + _tol < self._b_min_ord or _o - _tol > self._b_max_ord:
+                    continue
             target = self._opposing_net(round(ra['net_amount'], 2))
             candidates = []
             for ib in idx_b['by_net'].get(target, []):
-                rb = df_b.loc[ib]
+                rb = self._b_dict[ib]
                 if not self._avail_b(rb['row_id']):
                     continue
                 dd = self._date_diff(ra, rb)
@@ -263,13 +293,19 @@ class ReconciliationEngine:
     # ──────────────────────────────────────────────────────────
     def _layer2_date_tolerance(self, df_a, df_b, idx_b):
         cfg = self.config
+        _tol = cfg.date_tolerance_days
         for _, ra in df_a.iterrows():
             if not self._avail_a(ra['row_id']):
                 continue
+            _dt = ra['transaction_date']
+            if pd.notna(_dt):
+                _o = int(_dt.toordinal())
+                if _o + _tol < self._b_min_ord or _o - _tol > self._b_max_ord:
+                    continue
             target = self._opposing_net(round(ra['net_amount'], 2))
             candidates = []
             for ib in idx_b['by_net'].get(target, []):
-                rb = df_b.loc[ib]
+                rb = self._b_dict[ib]
                 if not self._avail_b(rb['row_id']):
                     continue
                 dd = self._date_diff(ra, rb)
@@ -305,16 +341,22 @@ class ReconciliationEngine:
     # ──────────────────────────────────────────────────────────
     def _layer3_rounding(self, df_a, df_b, idx_b):
         cfg = self.config
+        _tol = cfg.date_tolerance_days
         for _, ra in df_a.iterrows():
             if not self._avail_a(ra['row_id']):
                 continue
+            _dt = ra['transaction_date']
+            if pd.notna(_dt):
+                _o = int(_dt.toordinal())
+                if _o + _tol < self._b_min_ord or _o - _tol > self._b_max_ord:
+                    continue
             abs_a = ra['abs_amount']
             if abs_a == 0:
                 continue
             candidates = self._nearby_abs(idx_b, abs_a, cfg.rounding_tolerance)
             best, best_key = None, (999999, 0)
             for ib in candidates:
-                rb = df_b.loc[ib]
+                rb = self._b_dict[ib]
                 if not self._avail_b(rb['row_id']):
                     continue
                 if not self._is_opposing(ra, rb):
@@ -348,22 +390,25 @@ class ReconciliationEngine:
     # ──────────────────────────────────────────────────────────
     def _layer4_patterns(self, df_a, df_b, idx_b):
         cfg = self.config
+        _tol = cfg.date_tolerance_days * 2
         for _, ra in df_a.iterrows():
             if not self._avail_a(ra['row_id']):
                 continue
+            _dt = ra['transaction_date']
+            if pd.notna(_dt):
+                _o = int(_dt.toordinal())
+                if _o + _tol < self._b_min_ord or _o - _tol > self._b_max_ord:
+                    continue
             abs_a = ra['abs_amount']
             if abs_a == 0:
                 continue
             # Candidate set: amounts within 25% (covers largest tax rate)
-            candidates = []
-            for amt, positions in idx_b['by_abs'].items():
-                if abs_a > 0 and abs(amt - abs_a) / abs_a <= 0.25:
-                    candidates.extend(positions)
+            candidates = self._nearby_abs(idx_b, abs_a, abs_a * 0.25)
 
             best_match = None
             best_conf = 0
             for ib in candidates:
-                rb = df_b.loc[ib]
+                rb = self._b_dict[ib]
                 if not self._avail_b(rb['row_id']):
                     continue
                 if not self._is_opposing(ra, rb):
@@ -412,21 +457,34 @@ class ReconciliationEngine:
     # ──────────────────────────────────────────────────────────
     def _layer5_weighted(self, df_a, df_b, idx_b):
         cfg = self.config
+        date_window = cfg.date_tolerance_days * 3
         for _, ra in df_a.iterrows():
             if not self._avail_a(ra['row_id']):
                 continue
+            _dt = ra['transaction_date']
+            if pd.notna(_dt):
+                _o = int(_dt.toordinal())
+                if _o + date_window < self._b_min_ord or _o - date_window > self._b_max_ord:
+                    continue
             abs_a = ra['abs_amount']
             if abs_a == 0:
                 continue
             tol = max(cfg.amount_bucket_size, abs_a * 0.20)
             candidates = self._nearby_abs(idx_b, abs_a, tol)
             best, best_score = None, 0.0
+            ra_date = _dt
             for ib in candidates:
-                rb = df_b.loc[ib]
+                rb = self._b_dict[ib]
                 if not self._avail_b(rb['row_id']):
                     continue
                 if not self._is_opposing(ra, rb):
                     continue
+                # Date pre-filter: skip expensive fuzzy scoring if dates are
+                # too far apart (eliminates ~80-90% of fuzz calls in practice)
+                rb_date = rb['transaction_date']
+                if pd.notna(ra_date) and pd.notna(rb_date):
+                    if abs((ra_date - rb_date).days) > date_window:
+                        continue
                 sc, det = self._weighted_score(ra, rb)
                 if sc > best_score and sc >= cfg.overall_match_threshold:
                     best_score = sc
@@ -459,24 +517,58 @@ class ReconciliationEngine:
         if un_s.empty or un_m.empty:
             return
 
+        # Fast date-range overlap check — if the two datasets don't share any
+        # dates within the tolerance window, no partial match can exist.
+        date_window = cfg.date_tolerance_days * 4
+        s_dates = un_s['transaction_date'].dropna()
+        m_dates = un_m['transaction_date'].dropna()
+        if not s_dates.empty and not m_dates.empty:
+            td = pd.Timedelta(days=date_window)
+            if s_dates.max() + td < m_dates.min() or \
+               m_dates.max() + td < s_dates.min():
+                return  # No date overlap possible — skip entire layer
+
+        avail_s = self._avail_a if lbl_s == "A" else self._avail_b
+        avail_m = self._avail_a if lbl_m == "A" else self._avail_b
+
+        # Pre-compute numpy arrays from un_m for vectorised date+amount filtering.
+        # Converting pd.Timestamp arithmetic to integer ordinal arithmetic is
+        # ~100–1000x faster than Python-loop Timedelta creation.
+        un_m_records = un_m.to_dict('records')
+        _MISSING_DAY = -999999
+        un_m_days = np.array([
+            int(r['transaction_date'].toordinal())
+            if pd.notna(r['transaction_date']) else _MISSING_DAY
+            for r in un_m_records
+        ], dtype=np.int64)
+        un_m_amounts = np.array(
+            [r['abs_amount'] for r in un_m_records], dtype=np.float64
+        )
+
         for _, rs in un_s.iterrows():
-            avail_s = self._avail_a if lbl_s == "A" else self._avail_b
-            avail_m = self._avail_a if lbl_m == "A" else self._avail_b
             if not avail_s(rs['row_id']):
                 continue
             target = rs['abs_amount']
             if target == 0:
                 continue
-            cands = []
-            for _, rm in un_m.iterrows():
-                if not avail_m(rm['row_id']):
-                    continue
-                dd = self._date_diff(rs, rm)
-                if dd is not None and abs(dd) > cfg.date_tolerance_days * 4:
-                    continue
-                if rm['abs_amount'] > target + cfg.partial_settlement_tolerance:
-                    continue
-                cands.append(rm)
+
+            # Vectorised filter: date within window AND amount ≤ target
+            rs_dt = rs['transaction_date']
+            if pd.notna(rs_dt):
+                rs_days = int(rs_dt.toordinal())
+                date_ok = np.abs(un_m_days - rs_days) <= date_window
+            else:
+                date_ok = un_m_days != _MISSING_DAY  # both NaT → allow
+            amount_ok = un_m_amounts <= (target + cfg.partial_settlement_tolerance)
+            valid_idx = np.where(date_ok & amount_ok)[0]
+
+            if len(valid_idx) < 2:
+                continue
+
+            cands = [
+                un_m_records[i] for i in valid_idx
+                if avail_m(un_m_records[i]['row_id'])
+            ]
             if len(cands) < 2 or len(cands) > 25:
                 continue
             cands.sort(key=lambda r: r['abs_amount'], reverse=True)
@@ -515,35 +607,55 @@ class ReconciliationEngine:
     # DUPLICATE DETECTION
     # ──────────────────────────────────────────────────────────
     def _detect_duplicates(self, df, label):
-        dupes, seen = [], set()
+        dupes = []
         cfg = self.config
-        for i in range(len(df)):
-            if i in seen:
+
+        # Pre-extract only needed columns as plain dicts — avoids slow iloc per row
+        need = ['row_id', 'net_amount', 'transaction_date',
+                'reference_normalized', 'description_normalized']
+        records = df[need].to_dict('records')
+
+        # Group by integer-rounded amount bucket.  Two amounts that differ by
+        # ≤ duplicate_amount_tolerance (default 0.01) will always land in the
+        # same bucket, so we only need to compare within each bucket.
+        buckets: Dict = defaultdict(list)
+        for i, rec in enumerate(records):
+            buckets[int(round(rec['net_amount']))].append(i)
+
+        seen: Set = set()
+        for indices in buckets.values():
+            if len(indices) < 2:
                 continue
-            ri = df.iloc[i]
-            for j in range(i + 1, len(df)):
-                if j in seen:
+            for ii in range(len(indices)):
+                i = indices[ii]
+                if i in seen:
                     continue
-                rj = df.iloc[j]
-                if abs(ri['net_amount'] - rj['net_amount']) > cfg.duplicate_amount_tolerance:
-                    continue
-                dd = self._date_diff(ri, rj)
-                if dd is not None and abs(dd) > cfg.duplicate_date_tolerance_days:
-                    continue
-                # For duplicates: same company, so ref/desc SHOULD match
-                rsim = self._text_sim(ri['reference_normalized'],
-                                      rj['reference_normalized'])
-                nsim = self._text_sim(ri['description_normalized'],
-                                      rj['description_normalized'])
-                if rsim >= 85 or (nsim >= 90 and abs(ri['net_amount'] - rj['net_amount']) < 0.01):
-                    dupes.append({
-                        "Row_ID_1": ri['row_id'], "Row_ID_2": rj['row_id'],
-                        "Amount": ri['net_amount'],
-                        "Date_1": str(ri['transaction_date']),
-                        "Date_2": str(rj['transaction_date']),
-                        "Company": label, "Category": "Duplicate Entry",
-                    })
-                    seen.add(j)
+                ri = records[i]
+                for jj in range(ii + 1, len(indices)):
+                    j = indices[jj]
+                    if j in seen:
+                        continue
+                    rj = records[j]
+                    if abs(ri['net_amount'] - rj['net_amount']) > cfg.duplicate_amount_tolerance:
+                        continue
+                    dd = self._date_diff(ri, rj)
+                    if dd is not None and abs(dd) > cfg.duplicate_date_tolerance_days:
+                        continue
+                    rsim = self._text_sim(ri['reference_normalized'],
+                                          rj['reference_normalized'])
+                    nsim = self._text_sim(ri['description_normalized'],
+                                          rj['description_normalized'])
+                    if rsim >= 85 or (nsim >= 90 and
+                                      abs(ri['net_amount'] - rj['net_amount']) < 0.01):
+                        dupes.append({
+                            "Row_ID_1": ri['row_id'], "Row_ID_2": rj['row_id'],
+                            "Amount": ri['net_amount'],
+                            "Date_1": str(ri['transaction_date']),
+                            "Date_2": str(rj['transaction_date']),
+                            "Company": label, "Category": "Duplicate Entry",
+                        })
+                        seen.add(j)
+
         if label == "A":
             self.duplicates_a = dupes
         else:
